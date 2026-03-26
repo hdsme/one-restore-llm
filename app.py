@@ -228,18 +228,19 @@ def main():
         lq_tensor = transforms.ToTensor()(lq).unsqueeze(0).to(device)
         lq_em = transform_resize(lq).unsqueeze(0).to(device)
 
+        # Lưu ảnh tạm vào bộ nhớ để sử dụng hàm có sẵn
+        import io
+        temp_path = 'temp_upload_image.png'
+        lq.save(temp_path)
+        pred_category = predict_image(temp_path, clf, classes)
+
         # --- Predict or use prompt
         if prompt is None:
-            # Lưu ảnh tạm vào bộ nhớ để sử dụng hàm có sẵn
-            import io
-            temp_path = 'temp_upload_image.png'
-            lq.save(temp_path)
-            pred_category = predict_image(temp_path, clf, classes)
             caption = generate_caption(temp_path, pred_category, 'uploaded_image')
-            text_embedding, _, _ = embedder([caption], 'text_encoder')
         else:
-            text_embedding, _, [pred_category] = embedder([prompt], 'text_encoder')
             caption = prompt
+
+        text_embedding, _, _ = embedder([caption], 'text_encoder')
 
         # --- Restore image
         with torch.no_grad():
