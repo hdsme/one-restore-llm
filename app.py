@@ -30,13 +30,30 @@ def encode_image(image_path):
     with open(image_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
+# def extract_feature(img_path):
+#     """Trích vector đặc trưng từ ảnh bằng CLIP"""
+#     image = Image.open(img_path).convert("RGB")
+#     inputs = clip_processor(images=image, return_tensors="pt").to(device)
+#     with torch.no_grad():
+#         features = clip_model.get_image_features(**inputs)
+#     return features.cpu().numpy().flatten()
+
 def extract_feature(img_path):
-    """Trích vector đặc trưng từ ảnh bằng CLIP"""
+    """Trích vector đặc trưng từ ảnh bằng CLIP (fix lỗi BaseModelOutputWithPooling)"""
     image = Image.open(img_path).convert("RGB")
-    inputs = clip_processor(images=image, return_tensors="pt").to(device)
+    inputs = clip_processor(images=image, return_tensors="pt").to(device_clip)
     with torch.no_grad():
-        features = clip_model.get_image_features(**inputs)
+        outputs = clip_model.get_image_features(**inputs)
+        
+        # Lấy tensor thực sự chứa feature
+        if hasattr(outputs, "pooler_output"):
+            features = outputs.pooler_output   # thông thường là CLS token
+        elif hasattr(outputs, "last_hidden_state"):
+            features = outputs.last_hidden_state[:, 0, :]  # CLS token fallback
+        else:
+            features = outputs  # nếu outputs đã là tensor
     return features.cpu().numpy().flatten()
+    
 
 # ========================
 # Dataset + Classifier
