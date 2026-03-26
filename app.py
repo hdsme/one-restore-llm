@@ -142,17 +142,19 @@ def generate_caption(img_path, category, img_id):
 # ========================
 # Main pipeline
 # ========================
-def main(args):
+def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     # --- 1) Initialize models
     print('> Model Initialization...')
-    embedder = load_embedder_ckpt(device, freeze_model=True, ckpt_name=args.embedder_model_path)
-    restorer = load_restore_ckpt(device, freeze_model=True, ckpt_name=args.restore_model_path)
+    embedder = load_embedder_ckpt(device, freeze_model=True, ckpt_name='/kaggle/working/ckpts/embedder_model.tar')
+    restorer = load_restore_ckpt(device, freeze_model=True, ckpt_name='/kaggle/working/ckpts/onerestore_cdd-11.tar')
 
     # --- 2) Load or train degradation classifier
     clf, classes = load_or_train_classifier(
-        args.train_dir, args.test_dir, args.clip_classifier_path
+        '/kaggle/input/datasets/mintesnotfikir/cdd-11-30/CDD-11_train', 
+        '/kaggle/input/datasets/mintesnotfikir/cdd-11-30/CDD-11_test', 
+        '/kaggle/working/ckpts/clip_degradation_classifier.pkl'
     )
 
     # os.makedirs(args.output, exist_ok=True)
@@ -250,3 +252,5 @@ def main(args):
     )
 
     iface.launch(share=True)
+
+main()
