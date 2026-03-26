@@ -18,9 +18,9 @@ transform_resize = transforms.Compose([
         transforms.ToTensor()
         ]) 
 
-device_clip = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 clip_model_id = "openai/clip-vit-base-patch32"
-clip_model = CLIPModel.from_pretrained(clip_model_id).to(device_clip)
+clip_model = CLIPModel.from_pretrained(clip_model_id).to(device)
 clip_processor = CLIPProcessor.from_pretrained(clip_model_id)
 
 def encode_image(image_path):
@@ -30,7 +30,7 @@ def encode_image(image_path):
 def extract_feature(img_path):
     """Trích vector đặc trưng từ ảnh bằng CLIP"""
     image = Image.open(img_path).convert("RGB")
-    inputs = clip_processor(images=image, return_tensors="pt").to(device_clip)
+    inputs = clip_processor(images=image, return_tensors="pt").to(device)
     with torch.no_grad():
         features = clip_model.get_image_features(**inputs)
     return features.cpu().numpy().flatten()
@@ -134,72 +134,7 @@ def generate_caption(img_path, category, img_id):
         caption = ""
 
     return caption
-
-
-# ========================
-# Main pipeline
-# ========================
-def main(args):
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-    # --- 1) Initialize models
-    print('> Model Initialization...')
-    embedder = load_embedder_ckpt(device, freeze_model=True, ckpt_name=args.embedder_model_path)
-    restorer = load_restore_ckpt(device, freeze_model=True, ckpt_name=args.restore_model_path)
-
-    # --- 2) Load or train degradation classifier
-    clf, classes = load_or_train_classifier(
-        args.train_dir, args.test_dir, args.clip_classifier_path
-    )
-
-    os.makedirs(args.output, exist_ok=True)
-    files = os.listdir(args.input)
-    time_record = []
-
-    for i in files:
-        lq_path = os.path.join(args.input, i)
-        lq = Image.open(lq_path)
-
-        with torch.no_grad():
-            # --- 3) Preprocess
-            lq_re = torch.from_numpy((np.array(lq)/255).transpose(2, 0, 1)).unsqueeze(0).float().to(device)
-            lq_em = transform_resize(lq).unsqueeze(0).to(device)
-
-            start_time = time.time()
-
-            # --- 4) Decide embedding source
-            if args.prompt is None:
-                # Step 1: predict degradation category bằng CLIP+LogReg
-                pred_category_from_image = predict_image(lq_path, clf, classes)
-                print(f'Estimated degradation (from image): {pred_category_from_image}')
-
-                # Step 2: generate caption động
-                caption = generate_caption(lq_path, pred_category_from_image, i)
-                print(f'Generated caption: {caption}')
-
-                # Step 3: encode caption thành text embedding
-                text_embedding_caption, _, _ = embedder([caption], 'text_encoder')
-                used_text_embedding = text_embedding_caption
-            else:
-                # User provided a manual prompt
-                text_embedding_prompt, _, [pred_category_from_prompt] = embedder([args.prompt], 'text_encoder')
-                used_text_embedding = text_embedding_prompt
-                print(f'Using user-provided prompt: "{args.prompt}" (category: {pred_category_from_prompt})')
-
-            # --- 5) Run restoration
-            out = restorer(lq_re, used_text_embedding)
-
-            run_time = time.time() - start_time
-            time_record.append(run_time)
-
-            if args.concat:
-                out = torch.cat((lq_re, out), dim=3)
-
-            imwrite(out, os.path.join(args.output, i), value_range=(0, 1))
-            print(f'{i} → Done. Running Time: {run_time:.4f}s.')
-
-    print(f'Average time is {np.mean(time_record):.4f}s')
-            
+     
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
