@@ -41,7 +41,7 @@ def encode_image(image_path):
 def extract_feature(img_path):
     """Trích vector đặc trưng từ ảnh bằng CLIP (fix lỗi BaseModelOutputWithPooling)"""
     image = Image.open(img_path).convert("RGB")
-    inputs = clip_processor(images=image, return_tensors="pt").to(device_clip)
+    inputs = clip_processor(images=image, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = clip_model.get_image_features(**inputs)
         
@@ -53,7 +53,7 @@ def extract_feature(img_path):
         else:
             features = outputs  # nếu outputs đã là tensor
     return features.cpu().numpy().flatten()
-    
+
 
 # ========================
 # Dataset + Classifier
