@@ -1,89 +1,253 @@
-
-import torch
-import gradio as gr
-from torchvision import transforms
+import os, time, argparse
 from PIL import Image
 import numpy as np
-from utils.utils import load_restore_ckpt, load_embedder_ckpt
-import os
-from gradio_imageslider import ImageSlider
+from openai import OpenAI
+import joblib
+from transformers import CLIPProcessor, CLIPModel
+import torch
+from torchvision import transforms
+from torchvision.utils import save_image as imwrite
+from utils.utils import print_args, load_restore_ckpt, load_embedder_ckpt
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report
+import base64
+import gradio as gr
 
-# Enforce CPU usage
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-embedder_model_path = "ckpts/embedder_model.tar"  # Update with actual path to embedder checkpoint
-restorer_model_path = "ckpts/onerestore_cdd-11.tar"   # Update with actual path to restorer checkpoint
-
-# Load models on CPU only
-embedder = load_embedder_ckpt(device, freeze_model=True, ckpt_name=embedder_model_path)
-restorer = load_restore_ckpt(device, freeze_model=True, ckpt_name=restorer_model_path)
-
-# Define image preprocessing and postprocessing
 transform_resize = transforms.Compose([
         transforms.Resize([224,224]),
         transforms.ToTensor()
         ]) 
 
+device_clip = "cuda" if torch.cuda.is_available() else "cpu"
+clip_model_id = "openai/clip-vit-base-patch32"
+clip_model = CLIPModel.from_pretrained(clip_model_id).to(device_clip)
+clip_processor = CLIPProcessor.from_pretrained(clip_model_id)
 
-def postprocess_image(tensor):
-    image = tensor.squeeze(0).cpu().detach().numpy()
-    image = (image) * 255  # Assuming output in [-1, 1], rescale to [0, 255]
-    image = np.clip(image, 0, 255).astype("uint8")  # Clip values to [0, 255]
-    return Image.fromarray(image.transpose(1, 2, 0))  # Reorder to (H, W, C)
+def encode_image(image_path):
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
-# Define the enhancement function
-def enhance_image(image, degradation_type=None):
-    # Preprocess the image
-    input_tensor = torch.Tensor((np.array(image)/255).transpose(2, 0, 1)).unsqueeze(0).to("cuda" if torch.cuda.is_available() else "cpu")
-    lq_em = transform_resize(image).unsqueeze(0).to("cuda" if torch.cuda.is_available() else "cpu")
-    lq_em = transform_resize(image).unsqueeze(0).to("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Generate embedding
-    if degradation_type == "auto" or degradation_type is None:
-        text_embedding, _, [text] = embedder(lq_em, 'image_encoder')
-    else:
-        text_embedding, _, [text] = embedder([degradation_type], 'text_encoder')
-    
-    # Model inference
+def extract_feature(img_path):
+    """Trích vector đặc trưng từ ảnh bằng CLIP"""
+    image = Image.open(img_path).convert("RGB")
+    inputs = clip_processor(images=image, return_tensors="pt").to(device_clip)
     with torch.no_grad():
-        enhanced_tensor = restorer(input_tensor, text_embedding)
-    
-    # Postprocess the output
-    return (image, postprocess_image(enhanced_tensor)), text
+        features = clip_model.get_image_features(**inputs)
+    return features.cpu().numpy().flatten()
 
-# Define the Gradio interface
-def inference(image, degradation_type=None):
-    return enhance_image(image, degradation_type)
+# ========================
+# Dataset + Classifier
+# ========================
+def build_dataset(root_dir):
+    """Trích toàn bộ features cho dataset"""
+    X, y, classes = [], [], sorted(os.listdir(root_dir))
+    for label, cls in enumerate(classes):
+        cls_dir = os.path.join(root_dir, cls)
+        for img_file in os.listdir(cls_dir):
+            img_path = os.path.join(cls_dir, img_file)
+            feat = extract_feature(img_path)
+            X.append(feat)
+            y.append(label)
+    return np.array(X), np.array(y), classes
 
-#### Image,Prompts examples
-examples = [
-            ['image/low_haze_rain_00469_01_lq.png'],
-            ['image/low_haze_snow_00337_01_lq.png'],
-            ]
+
+def load_or_train_classifier(train_dir, test_dir, model_path="clip_degradation_classifier.pkl"):
+    """Nếu có .pkl thì load, ngược lại train mới, nhưng luôn in classification_report trên test set"""
+    if os.path.exists(model_path):
+        print(f"✅ Found existing model at {model_path}, loading...")
+        clf, classes = joblib.load(model_path)
+
+        # Dù load sẵn thì vẫn evaluate lại
+        _, _, classes_test = build_dataset(test_dir)
+        X_test, y_test, _ = build_dataset(test_dir)
+        y_pred = clf.predict(X_test)
+        print(classification_report(y_test, y_pred, target_names=classes))
+    else:
+        print("⚡ Training new model...")
+        X_train, y_train, classes = build_dataset(train_dir)
+        X_test, y_test, _ = build_dataset(test_dir)
+
+        print("Train size:", X_train.shape, " Test size:", X_test.shape)
+
+        clf = LogisticRegression(max_iter=2000)
+        clf.fit(X_train, y_train)
+
+        # Save model
+        joblib.dump((clf, classes), model_path)
+
+        # Evaluate
+        y_pred = clf.predict(X_test)
+        print(classification_report(y_test, y_pred, target_names=classes))
+
+    return clf, classes
+
+
+def predict_image(img_path, clf, classes):
+    """Dự đoán class degradation cho ảnh bất kỳ"""
+    feat = extract_feature(img_path)
+    pred = clf.predict([feat])[0]
+    return classes[pred]
 
 
 
-# Create the Gradio app interface using updated API
-interface = gr.Interface(
-    fn=inference,
+def generate_caption(img_path, category, img_id):
+    """
+    Generate an objective caption using the raw image as input.
+    The LLM analyzes perceptual degradations directly from the image.
+    """
+    prompt = f"""
+    You are an image degradation analysis assistant.
+
+    Task:
+    Analyze the image "{img_id}" and explain why it belongs to the category "{category}".
+    Base your explanation only on what you observe in the image.
+
+    Guidelines:
+    1. Evaluate key perceptual properties: brightness, contrast, texture, sharpness, and clarity. For each, briefly explain how it appears in the image.
+    2. Describe observable degradations in simple, objective terms (e.g., blurring, dimness, loss of detail, washed-out colors) and explain their impact on visibility.
+    3. Determine the severity level of "{category}" in the image (e.g., low, moderate, strong) and justify your choice.
+    4. Keep the explanation concise: 3–4 sentences, around 80-100 words.
+    5. Conclude with a justification that clearly links the observed degradations to the "{category}" label.
+    6. Do not mention technical details such as embeddings, features, or statistics.
+    """
+
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+    try:
+        image_base64 = encode_image(img_path)
+
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+                    ],
+                }
+            ],
+        )
+        caption = response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"⚠️ LLM error on {img_id}: {e}")
+        caption = ""
+
+    return caption
+
+
+# ========================
+# Main pipeline
+# ========================
+def main(args):
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # --- 1) Initialize models
+    print('> Model Initialization...')
+    embedder = load_embedder_ckpt(device, freeze_model=True, ckpt_name=args.embedder_model_path)
+    restorer = load_restore_ckpt(device, freeze_model=True, ckpt_name=args.restore_model_path)
+
+    # --- 2) Load or train degradation classifier
+    clf, classes = load_or_train_classifier(
+        args.train_dir, args.test_dir, args.clip_classifier_path
+    )
+
+    os.makedirs(args.output, exist_ok=True)
+    files = os.listdir(args.input)
+    time_record = []
+
+    for i in files:
+        lq_path = os.path.join(args.input, i)
+        lq = Image.open(lq_path)
+
+        with torch.no_grad():
+            # --- 3) Preprocess
+            lq_re = torch.from_numpy((np.array(lq)/255).transpose(2, 0, 1)).unsqueeze(0).float().to(device)
+            lq_em = transform_resize(lq).unsqueeze(0).to(device)
+
+            start_time = time.time()
+
+            # --- 4) Decide embedding source
+            if args.prompt is None:
+                # Step 1: predict degradation category bằng CLIP+LogReg
+                pred_category_from_image = predict_image(lq_path, clf, classes)
+                print(f'Estimated degradation (from image): {pred_category_from_image}')
+
+                # Step 2: generate caption động
+                caption = generate_caption(lq_path, pred_category_from_image, i)
+                print(f'Generated caption: {caption}')
+
+                # Step 3: encode caption thành text embedding
+                text_embedding_caption, _, _ = embedder([caption], 'text_encoder')
+                used_text_embedding = text_embedding_caption
+            else:
+                # User provided a manual prompt
+                text_embedding_prompt, _, [pred_category_from_prompt] = embedder([args.prompt], 'text_encoder')
+                used_text_embedding = text_embedding_prompt
+                print(f'Using user-provided prompt: "{args.prompt}" (category: {pred_category_from_prompt})')
+
+            # --- 5) Run restoration
+            out = restorer(lq_re, used_text_embedding)
+
+            run_time = time.time() - start_time
+            time_record.append(run_time)
+
+            if args.concat:
+                out = torch.cat((lq_re, out), dim=3)
+
+            imwrite(out, os.path.join(args.output, i), value_range=(0, 1))
+            print(f'{i} → Done. Running Time: {run_time:.4f}s.')
+
+    print(f'Average time is {np.mean(time_record):.4f}s')
+            
+
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+
+def run_on_image(image, prompt=None, concat=False):
+    lq = image.convert('RGB')
+    lq_tensor = transforms.ToTensor()(lq).unsqueeze(0).to(device)
+    lq_em = transform_resize(lq).unsqueeze(0).to(device)
+
+    # --- Predict or use prompt
+    if prompt is None:
+        # Lưu ảnh tạm vào bộ nhớ để sử dụng hàm có sẵn
+        import io
+        temp_path = 'temp_upload_image.png'
+        lq.save(temp_path)
+        pred_category = predict_image(temp_path, clf, classes)
+        caption = generate_caption(temp_path, pred_category, 'uploaded_image')
+        text_embedding, _, _ = embedder([caption], 'text_encoder')
+    else:
+        text_embedding, _, [pred_category] = embedder([prompt], 'text_encoder')
+        caption = prompt
+
+    # --- Restore image
+    with torch.no_grad():
+        restored = restorer(lq_tensor, text_embedding)
+        if concat:
+            restored = torch.cat((lq_tensor, restored), dim=3)
+
+    restored_image = restored.squeeze(0).cpu()
+    restored_pil = transforms.ToPILImage()(restored_image.clamp(0,1))
+    return restored_pil, pred_category, caption
+
+# --- Gradio Interface
+iface = gr.Interface(
+    fn=run_on_image,
     inputs=[
-        gr.Image(type="pil", value="image/low_haze_rain_00469_01_lq.png"),  # Image input
-        gr.Dropdown(['auto', 'low', 'haze', 'rain', 'snow',\
-                                            'low_haze', 'low_rain', 'low_snow', 'haze_rain',\
-                                                    'haze_snow', 'low_haze_rain', 'low_haze_snow'], label="Degradation Type", value="auto")  # Manual or auto degradation
+        gr.Image(type='pil', label='Input Image'),
+        gr.Textbox(label='Prompt (optional)', placeholder='Leave empty for automatic degradation analysis'),
+        gr.Checkbox(label='Concatenate Input + Output', value=False)
     ],
     outputs=[
-        ImageSlider(label="Restored Image", 
-                        type="pil",
-                        show_download_button=True,
-                        ),  # Enhanced image outputImageSlider(type="pil", show_download_button=True, ),
-        gr.Textbox(label="Degradation Type")  # Display the estimated degradation type
+        gr.Image(type='pil', label='Restored Image'),
+        gr.Textbox(label='Predicted Category'),
+        gr.Textbox(label='Caption / Explanation')
     ],
-    title="Image Restoration with OneRestore",
-    description="Upload an image and enhance it using OneRestore model. You can choose to let the model automatically estimate the degradation type or set it manually.",
-    examples=examples,
+    title='OneRestore Gradio Demo',
+    description='Upload an image and get the restored version using OneRestore. You can optionally provide a prompt or let the system automatically detect degradation.'
 )
 
-# Launch the app
-if __name__ == "__main__":
-    interface.launch()
+iface.launch(share=True)
