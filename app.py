@@ -13,6 +13,9 @@ from sklearn.metrics import classification_report
 import base64
 import gradio as gr
 
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 transform_resize = transforms.Compose([
         transforms.Resize([224,224]),
         transforms.ToTensor()
@@ -134,55 +137,116 @@ def generate_caption(img_path, category, img_id):
         caption = ""
 
     return caption
-     
-
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 
-def run_on_image(image, prompt=None, concat=False):
-    lq = image.convert('RGB')
-    lq_tensor = transforms.ToTensor()(lq).unsqueeze(0).to(device)
-    lq_em = transform_resize(lq).unsqueeze(0).to(device)
+# ========================
+# Main pipeline
+# ========================
+def main(args):
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # --- Predict or use prompt
-    if prompt is None:
-        # Lưu ảnh tạm vào bộ nhớ để sử dụng hàm có sẵn
-        import io
-        temp_path = 'temp_upload_image.png'
-        lq.save(temp_path)
-        pred_category = predict_image(temp_path, clf, classes)
-        caption = generate_caption(temp_path, pred_category, 'uploaded_image')
-        text_embedding, _, _ = embedder([caption], 'text_encoder')
-    else:
-        text_embedding, _, [pred_category] = embedder([prompt], 'text_encoder')
-        caption = prompt
+    # --- 1) Initialize models
+    print('> Model Initialization...')
+    embedder = load_embedder_ckpt(device, freeze_model=True, ckpt_name=args.embedder_model_path)
+    restorer = load_restore_ckpt(device, freeze_model=True, ckpt_name=args.restore_model_path)
 
-    # --- Restore image
-    with torch.no_grad():
-        restored = restorer(lq_tensor, text_embedding)
-        if concat:
-            restored = torch.cat((lq_tensor, restored), dim=3)
+    # --- 2) Load or train degradation classifier
+    clf, classes = load_or_train_classifier(
+        args.train_dir, args.test_dir, args.clip_classifier_path
+    )
 
-    restored_image = restored.squeeze(0).cpu()
-    restored_pil = transforms.ToPILImage()(restored_image.clamp(0,1))
-    return restored_pil, pred_category, caption
+    # os.makedirs(args.output, exist_ok=True)
+    # files = os.listdir(args.input)
+    # time_record = []
 
-# --- Gradio Interface
-iface = gr.Interface(
-    fn=run_on_image,
-    inputs=[
-        gr.Image(type='pil', label='Input Image'),
-        gr.Textbox(label='Prompt (optional)', placeholder='Leave empty for automatic degradation analysis'),
-        gr.Checkbox(label='Concatenate Input + Output', value=False)
-    ],
-    outputs=[
-        gr.Image(type='pil', label='Restored Image'),
-        gr.Textbox(label='Predicted Category'),
-        gr.Textbox(label='Caption / Explanation')
-    ],
-    title='OneRestore Gradio Demo',
-    description='Upload an image and get the restored version using OneRestore. You can optionally provide a prompt or let the system automatically detect degradation.'
-)
+    # for i in files:
+    #     lq_path = os.path.join(args.input, i)
+    #     lq = Image.open(lq_path)
 
-iface.launch(share=True)
+    #     with torch.no_grad():
+    #         # --- 3) Preprocess
+    #         lq_re = torch.from_numpy((np.array(lq)/255).transpose(2, 0, 1)).unsqueeze(0).float().to(device)
+    #         lq_em = transform_resize(lq).unsqueeze(0).to(device)
+
+    #         start_time = time.time()
+
+    #         # --- 4) Decide embedding source
+    #         if args.prompt is None:
+    #             # Step 1: predict degradation category bằng CLIP+LogReg
+    #             pred_category_from_image = predict_image(lq_path, clf, classes)
+    #             print(f'Estimated degradation (from image): {pred_category_from_image}')
+
+    #             # Step 2: generate caption động
+    #             caption = generate_caption(lq_path, pred_category_from_image, i)
+    #             print(f'Generated caption: {caption}')
+
+    #             # Step 3: encode caption thành text embedding
+    #             text_embedding_caption, _, _ = embedder([caption], 'text_encoder')
+    #             used_text_embedding = text_embedding_caption
+    #         else:
+    #             # User provided a manual prompt
+    #             text_embedding_prompt, _, [pred_category_from_prompt] = embedder([args.prompt], 'text_encoder')
+    #             used_text_embedding = text_embedding_prompt
+    #             print(f'Using user-provided prompt: "{args.prompt}" (category: {pred_category_from_prompt})')
+
+    #         # --- 5) Run restoration
+    #         out = restorer(lq_re, used_text_embedding)
+
+    #         run_time = time.time() - start_time
+    #         time_record.append(run_time)
+
+    #         if args.concat:
+    #             out = torch.cat((lq_re, out), dim=3)
+
+    #         imwrite(out, os.path.join(args.output, i), value_range=(0, 1))
+    #         print(f'{i} → Done. Running Time: {run_time:.4f}s.')
+
+    # print(f'Average time is {np.mean(time_record):.4f}s')
+            
+
+    def run_on_image(image, prompt=None, concat=False):
+        lq = image.convert('RGB')
+        lq_tensor = transforms.ToTensor()(lq).unsqueeze(0).to(device)
+        lq_em = transform_resize(lq).unsqueeze(0).to(device)
+
+        # --- Predict or use prompt
+        if prompt is None:
+            # Lưu ảnh tạm vào bộ nhớ để sử dụng hàm có sẵn
+            import io
+            temp_path = 'temp_upload_image.png'
+            lq.save(temp_path)
+            pred_category = predict_image(temp_path, clf, classes)
+            caption = generate_caption(temp_path, pred_category, 'uploaded_image')
+            text_embedding, _, _ = embedder([caption], 'text_encoder')
+        else:
+            text_embedding, _, [pred_category] = embedder([prompt], 'text_encoder')
+            caption = prompt
+
+        # --- Restore image
+        with torch.no_grad():
+            restored = restorer(lq_tensor, text_embedding)
+            if concat:
+                restored = torch.cat((lq_tensor, restored), dim=3)
+
+        restored_image = restored.squeeze(0).cpu()
+        restored_pil = transforms.ToPILImage()(restored_image.clamp(0,1))
+        return restored_pil, pred_category, caption
+
+    # --- Gradio Interface
+    iface = gr.Interface(
+        fn=run_on_image,
+        inputs=[
+            gr.Image(type='pil', label='Input Image'),
+            gr.Textbox(label='Prompt (optional)', placeholder='Leave empty for automatic degradation analysis'),
+            gr.Checkbox(label='Concatenate Input + Output', value=False)
+        ],
+        outputs=[
+            gr.Image(type='pil', label='Restored Image'),
+            gr.Textbox(label='Predicted Category'),
+            gr.Textbox(label='Caption / Explanation')
+        ],
+        title='OneRestore Gradio Demo',
+        description='Upload an image and get the restored version using OneRestore. You can optionally provide a prompt or let the system automatically detect degradation.'
+    )
+
+    iface.launch(share=True)
